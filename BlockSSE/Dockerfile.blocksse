@@ -1,0 +1,13 @@
+FROM ubuntu:20.04
+
+RUN apt-get update && apt-get install -y \
+    openjdk-11-jre-headless \
+    bash \
+    iperf3 \
+    iproute2 \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/BlockSSE
+COPY build/install/BlockSSE/ .
+RUN chmod +x ./smartrun.sh

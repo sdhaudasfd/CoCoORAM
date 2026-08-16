@@ -1,0 +1,6 @@
+build/
+results/
+plots/
+*.class
+__pycache__/
+*.pyc

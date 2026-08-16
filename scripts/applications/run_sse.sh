@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+RESULT_DIR="$ROOT_DIR/results/applications"
+mkdir -p "$RESULT_DIR"
+
+CLIENT_VALUES="${CLIENT_VALUES:-1 5 10 15 20 30 40 50}"
+N_SEARCHES="${N_SEARCHES:-1000}"
+BID_EXPONENT="${BID_EXPONENT:-17}"
+BLOCK_SIZE="${BLOCK_SIZE:-256}"
+BANDWIDTH="${BANDWIDTH:-10gbit}"
+JAVA_HEAP_OPTS="${JAVA_HEAP_OPTS:--Xms16g -Xmx256g}"
+
+(cd "$ROOT_DIR/OurSSE" && chmod +x gradlew && ./gradlew clean installDist)
+(cd "$ROOT_DIR/BlockSSE" && chmod +x gradlew && ./gradlew clean installDist)
+
+CLIENT_VALUES="$CLIENT_VALUES" N_SEARCHES="$N_SEARCHES" \
+BID_EXPONENT="$BID_EXPONENT" ROOT_BUCKET_SIZE=1 COMPETITION_BUCKET_SIZE=2 \
+BUCKET_SIZE=3 BLOCK_SIZE="$BLOCK_SIZE" QUERY_MODE=uniform BANDWIDTH="$BANDWIDTH" \
+BUILD_IMAGE=1 STOP_ON_FAILURE=1 JAVA_HEAP_OPTS="$JAVA_HEAP_OPTS" \
+RESULT_CSV="$RESULT_DIR/coco_sse.csv" \
+bash "$ROOT_DIR/OurSSE/run_sse_docker_sweep.sh"
+
+CLIENT_VALUES="$CLIENT_VALUES" N_SEARCHES="$N_SEARCHES" \
+BID_EXPONENT="$BID_EXPONENT" ROOT_BUCKET_SIZE=3 BUCKET_SIZE=3 \
+BLOCK_SIZE="$BLOCK_SIZE" QUERY_MODE=uniform BANDWIDTH="$BANDWIDTH" \
+BUILD_PROJECT=0 BUILD_IMAGE=1 JAVA_HEAP_OPTS="$JAVA_HEAP_OPTS" \
+RESULT_CSV="$RESULT_DIR/blocksse.csv" \
+bash "$ROOT_DIR/BlockSSE/run_blocksse_docker_suite.sh"
+
+python3 "$SCRIPT_DIR/plot_sse.py"

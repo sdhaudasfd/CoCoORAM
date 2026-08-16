@@ -1,0 +1,339 @@
+package oram.benchmark;
+
+import oram.client.ClientAccessExecutor;
+import oram.client.ORAMManager;
+import oram.client.PerformanceOnlyStats;
+import oram.client.TimestepBarrier;
+import oram.client.module.ClientAccessResult;
+import oram.client.module.DelayedRequest;
+import oram.utils.Operation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
+
+public class OursBenchmark {
+    private static final Logger logger = LoggerFactory.getLogger("benchmarking");
+    private static final int FIRST_CLIENT_ID = 1;
+
+    public static void main(String[] args) throws InterruptedException {
+        if (args.length != 10) {
+            System.out.println("Usage: ... oram.benchmark.OursBenchmark " +
+                    "<nRequests> <nClients> <maxConcurrentClients> <bidExponent> <rootBucketSize> " +
+                    "<competitionBucketSize> <bucketSize> <blockSize> <server ip> <server port>");
+            System.exit(-1);
+        }
+
+        int nRequests = Integer.parseInt(args[0]);
+        int nClients = Integer.parseInt(args[1]);
+        int c = Integer.parseInt(args[2]);
+        int bidExponent = Integer.parseInt(args[3]);
+        int rootBucketSize = Integer.parseInt(args[4]);
+        int competitionBucketSize = Integer.parseInt(args[5]);
+        int bucketSize = Integer.parseInt(args[6]);
+        int blockSize = Integer.parseInt(args[7]);
+        String serverIp = args[8];
+        int serverPort = Integer.parseInt(args[9]);
+
+        if (bidExponent <= 0 || bidExponent >= 31) {
+            throw new IllegalArgumentException("bidExponent must be in [1, 30]");
+        }
+
+        if (c <= 0 || c > nClients) {
+            throw new IllegalArgumentException(
+                    "maxConcurrentClients must be positive and no larger than nClients"
+            );
+        }
+        long requestedOps = (long) nClients * nRequests;
+        int paddingOps = (int) ((c - requestedOps % c) % c);
+        int bidSpace = 1 << bidExponent;
+        int leafCount = bidSpace;
+        int treeHeight = bidExponent + 1;
+
+        ORAMManager.resetBandwidthStats();
+        ClientAccessExecutor.resetTimingStats();
+        PerformanceOnlyStats.reset();
+
+        CountDownLatch readyLatch = new CountDownLatch(nClients);
+        boolean coarseAdmissionGroups = booleanProperty("oram.coarseAdmissionGroups", false);
+        if (coarseAdmissionGroups && nClients % c != 0) {
+            throw new IllegalArgumentException("coarse admission groups require nClients to be divisible by c");
+        }
+        int groupCount = (nClients + c - 1) / c;
+        CountDownLatch sharedStartLatch = new CountDownLatch(1);
+        CountDownLatch[] groupStartLatches = new CountDownLatch[groupCount];
+        CountDownLatch[] groupDoneLatches = new CountDownLatch[groupCount];
+        for (int group = 0; group < groupCount; group++) {
+            groupStartLatches[group] = coarseAdmissionGroups
+                    ? new CountDownLatch(1)
+                    : sharedStartLatch;
+            groupDoneLatches[group] = new CountDownLatch(c);
+        }
+        TimestepBarrier round2ReadBarrier = new TimestepBarrier(c);
+
+        Client[] clients = new Client[nClients];
+        for (int i = 0; i < nClients; i++) {
+            clients[i] = new Client(
+                    FIRST_CLIENT_ID + i,
+                    nRequests,
+                    i < paddingOps ? 1 : 0,
+                    c,
+                    treeHeight,
+                    rootBucketSize,
+                    competitionBucketSize,
+                    bucketSize,
+                    blockSize,
+                    bidSpace,
+                    leafCount,
+                    serverIp,
+                    serverPort,
+                    readyLatch,
+                    groupStartLatches[i / c],
+                    groupDoneLatches[i / c],
+                    round2ReadBarrier
+            );
+            clients[i].start();
+            Thread.sleep(10);
+        }
+
+        readyLatch.await();
+        logger.info("Executing experiment, coarseAdmissionGroups={}", coarseAdmissionGroups);
+        if (paddingOps > 0) {
+            logger.info("Adding {} unmeasured padding accesses to complete the final timestep", paddingOps);
+        }
+        if (coarseAdmissionGroups) {
+            for (int group = 0; group < groupCount; group++) {
+                groupStartLatches[group].countDown();
+                groupDoneLatches[group].await();
+            }
+        } else {
+            sharedStartLatch.countDown();
+        }
+
+        for (Client client : clients) {
+            client.join();
+        }
+
+        for (Client client : clients) {
+            if (client.getFailure() != null) {
+                throw new RuntimeException("Benchmark client failed", client.getFailure());
+            }
+        }
+
+        long totalOps = 0;
+        long earliestStartNs = Long.MAX_VALUE;
+        long latestEndNs = Long.MIN_VALUE;
+
+        for (Client client : clients) {
+            totalOps += client.getCompletedOps();
+            earliestStartNs = Math.min(earliestStartNs, client.getFirstStartNs());
+            latestEndNs = Math.max(latestEndNs, client.getLastEndNs());
+        }
+
+        double wallClockSeconds =
+                totalOps == 0 ? 0.0 : (latestEndNs - earliestStartNs) / 1_000_000_000.0;
+
+        double throughputOpsPerSec =
+                wallClockSeconds == 0.0 ? 0.0 : totalOps / wallClockSeconds;
+
+        long clientResidentStorageBytesPerClient =
+                nClients == 0 ? 0L : clients[0].getResidentClientStorageBytes();
+
+        double avgRound1BandwidthBytesPerAccess =
+                totalOps == 0 ? 0.0 : ((double) ORAMManager.getRound1TotalBytes()) / totalOps;
+        double avgRound2BandwidthBytesPerAccess =
+                totalOps == 0 ? 0.0 : ((double) ORAMManager.getRound2TotalBytes()) / totalOps;
+        double avgRound3BandwidthBytesPerAccess =
+                totalOps == 0 ? 0.0 : ((double) ORAMManager.getRound3TotalBytes()) / totalOps;
+        double avgTotalBandwidthBytesPerAccess =
+                totalOps == 0 ? 0.0 : ((double) ORAMManager.getTotalProtocolBytes()) / totalOps;
+
+        long evictionOverflowEvents = PerformanceOnlyStats.getEvictionOverflowEvents();
+        long missingBlockEvents = PerformanceOnlyStats.getMissingBlockEvents();
+        long missingLastRLEvents = PerformanceOnlyStats.getMissingLastRLEvents();
+
+        ClientAccessExecutor.logTimingSummary();
+
+        logger.info(String.format(
+                "Ours Benchmark Summary:%n" +
+                        "\tConcurrent clients[#]: %d%n" +
+                        "\tProtocol window[#]: %d%n" +
+                        "\tRequests per client[#]: %d%n" +
+                        "\tPadding protocol ops[#]: %d%n" +
+                        "\tMeasured ops[#]: %d%n" +
+                        "\tWall-clock time[s]: %.3f%n" +
+                        "\tThroughput[ops/s]: %.3f%n" +
+                        "\tClient resident storage per client[bytes]: %d%n" +
+                        "\tAvg Round1 bandwidth per access[bytes]: %.3f%n" +
+                        "\tAvg Round2 bandwidth per access[bytes]: %.3f%n" +
+                        "\tAvg Round3 bandwidth per access[bytes]: %.3f%n" +
+                        "\tAvg Total bandwidth per access[bytes]: %.3f%n" +
+                        "\tEviction overflow events[#]: %d%n" +
+                        "\tMissing block events[#]: %d%n" +
+                        "\tMissing LastRL events[#]: %d",
+                nClients,
+                c,
+                nRequests,
+                paddingOps,
+                totalOps,
+                wallClockSeconds,
+                throughputOpsPerSec,
+                clientResidentStorageBytesPerClient,
+                avgRound1BandwidthBytesPerAccess,
+                avgRound2BandwidthBytesPerAccess,
+                avgRound3BandwidthBytesPerAccess,
+                avgTotalBandwidthBytesPerAccess,
+                evictionOverflowEvents,
+                missingBlockEvents,
+                missingLastRLEvents
+        ));
+    }
+
+    private static boolean booleanProperty(String name, boolean defaultValue) {
+        String value = System.getProperty(name);
+        if (value == null) {
+            return defaultValue;
+        }
+        return "1".equals(value) || Boolean.parseBoolean(value);
+    }
+
+    private static class Client extends Thread {
+        private final int clientId;
+        private final ORAMManager manager;
+        private final ClientAccessExecutor accessExecutor;
+        private final int nRequests;
+        private final int paddingRequests;
+        private final int bidSpace;
+        private final int blockSize;
+        private final CountDownLatch readyLatch;
+        private final CountDownLatch startLatch;
+        private final CountDownLatch groupDoneLatch;
+        private final SecureRandom random;
+
+        private long completedOps;
+        private long firstStartNs = Long.MAX_VALUE;
+        private long lastEndNs = Long.MIN_VALUE;
+        private Throwable failure;
+
+        private Client(int clientId,
+                       int nRequests,
+                       int paddingRequests,
+                       int c,
+                       int treeHeight,
+                       int rootBucketSize,
+                       int competitionBucketSize,
+                       int bucketSize,
+                       int blockSize,
+                       int bidSpace,
+                       int leafCount,
+                       String serverIp,
+                       int serverPort,
+                       CountDownLatch readyLatch,
+                       CountDownLatch startLatch,
+                       CountDownLatch groupDoneLatch,
+                       TimestepBarrier round2ReadBarrier) {
+            this.clientId = clientId;
+            this.nRequests = nRequests;
+            this.paddingRequests = paddingRequests;
+            this.bidSpace = bidSpace;
+            this.blockSize = blockSize;
+            this.readyLatch = readyLatch;
+            this.startLatch = startLatch;
+            this.groupDoneLatch = groupDoneLatch;
+            this.manager = new ORAMManager(clientId, serverIp, serverPort);
+            this.accessExecutor = new ClientAccessExecutor(
+                    manager,
+                    c,
+                    leafCount,
+                    treeHeight,
+                    rootBucketSize,
+                    competitionBucketSize,
+                    bucketSize,
+                    bidSpace,
+                    blockSize,
+                    round2ReadBarrier
+            );
+            this.random = new SecureRandom();
+            this.completedOps = 0L;
+            this.firstStartNs = Long.MAX_VALUE;
+            this.lastEndNs = Long.MIN_VALUE;
+        }
+
+        @Override
+        public void run() {
+            DelayedRequest delayedRequest = null;
+
+            try {
+                readyLatch.countDown();
+                startLatch.await();
+
+                int protocolRequests = nRequests + paddingRequests;
+                for (int i = 0; i < protocolRequests; i++) {
+                    int bid = random.nextInt(bidSpace);
+                    Operation operation = random.nextBoolean() ? Operation.WRITE : Operation.READ;
+                    byte[] payload = buildPayload(clientId, i, bid, blockSize);
+
+                    long t1 = System.nanoTime();
+                    firstStartNs = Math.min(firstStartNs, t1);
+
+                    ClientAccessResult result = accessExecutor.access(
+                            operation,
+                            bid,
+                            payload,
+                            delayedRequest
+                    );
+                    delayedRequest = result.getDelayedRequest();
+
+                    long t2 = System.nanoTime();
+                    lastEndNs = Math.max(lastEndNs, t2);
+                    if (i < nRequests) {
+                        completedOps++;
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                failure = e;
+            } catch (Throwable t) {
+                failure = t;
+                t.printStackTrace();
+            } finally {
+                groupDoneLatch.countDown();
+                manager.close();
+            }
+        }
+
+        public long getCompletedOps() {
+            return completedOps;
+        }
+
+        public long getFirstStartNs() {
+            return completedOps == 0 ? 0L : firstStartNs;
+        }
+
+        public long getLastEndNs() {
+            return completedOps == 0 ? 0L : lastEndNs;
+        }
+
+        public Throwable getFailure() {
+            return failure;
+        }
+
+        public long getResidentClientStorageBytes() {
+            return accessExecutor.getResidentClientStorageBytes();
+        }
+    }
+
+    private static byte[] buildPayload(int clientId, int opIndex, int bid, int blockSize) {
+        byte[] payload = new byte[blockSize];
+        Arrays.fill(payload, (byte) 0);
+
+        byte[] text = ("c" + clientId + "-op" + opIndex + "-bid" + bid)
+                .getBytes(StandardCharsets.UTF_8);
+        int length = Math.min(text.length, payload.length);
+        System.arraycopy(text, 0, payload, 0, length);
+        return payload;
+    }
+}

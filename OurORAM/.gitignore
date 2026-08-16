@@ -1,0 +1,7 @@
+.gradle/
+build/
+benchmark_logs/
+benchmark_results/
+results/
+__pycache__/
+*.pyc

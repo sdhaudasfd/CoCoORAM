@@ -1,0 +1,19 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    openjdk-11-jre-headless \
+    bash \
+    iperf3 \
+    iproute2 \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/OurORAM/build/install/OurORAM
+
+COPY build/install/OurORAM/ .
+
+RUN chmod +x ./smartrun.sh
+
+CMD ["bash"]

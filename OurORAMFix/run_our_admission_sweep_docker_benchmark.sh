@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLIENT_VALUES=(${CLIENT_VALUES:-1 5 10 15 20 30 40 50})
-CONCURRENCY_VALUES=(${CONCURRENCY_VALUES:-1 5 10 10 10 10 10 10})
+CONCURRENCY_VALUES=(${CONCURRENCY_VALUES:-1 5 10 15 10 10 10 10})
 RESULT_CSV="${RESULT_CSV:-$ROOT_DIR/benchmark_results/CoCoORAM_admission_sweep.csv}"
 BUILD_IMAGE_FIRST="${BUILD_IMAGE:-1}"
 RUN_LABEL="${RUN_LABEL:-}"
@@ -67,6 +67,7 @@ for ((i = 0; i < ${#CLIENT_VALUES[@]}; i++)); do
         fi
 
         if BUILD_IMAGE="$build_image" N_CLIENTS="$clients" MAX_CONCURRENT_CLIENTS="$concurrency" \
+            ROUND_ROBIN_ADMISSION_GROUPS="${ROUND_ROBIN_ADMISSION_GROUPS:-0}" \
             bash "$ROOT_DIR/run_our_docker_bandwidth_benchmark.sh"; then
             log="$ROOT_DIR/benchmark_logs/docker_bandwidth/client.log"
             total_ops="$(grep 'Measured ops\[#\]:' "$log" | tail -1 | awk -F: '{gsub(/[[:space:]]/,"",$2); print $2}')"

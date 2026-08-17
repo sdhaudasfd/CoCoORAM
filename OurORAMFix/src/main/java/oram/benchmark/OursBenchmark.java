@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 
 public class OursBenchmark {
     private static final Logger logger = LoggerFactory.getLogger("benchmarking");
@@ -59,18 +60,31 @@ public class OursBenchmark {
 
         CountDownLatch readyLatch = new CountDownLatch(nClients);
         boolean coarseAdmissionGroups = booleanProperty("oram.coarseAdmissionGroups", false);
-        if (coarseAdmissionGroups && nClients % c != 0) {
-            throw new IllegalArgumentException("coarse admission groups require nClients to be divisible by c");
+        boolean roundRobinAdmissionGroups = booleanProperty("oram.roundRobinAdmissionGroups", false);
+        if (coarseAdmissionGroups && roundRobinAdmissionGroups) {
+            throw new IllegalArgumentException("coarse and round-robin admission modes are mutually exclusive");
+        }
+        if ((coarseAdmissionGroups || roundRobinAdmissionGroups) && nClients % c != 0) {
+            throw new IllegalArgumentException("grouped admission requires nClients to be divisible by c");
+        }
+        if (roundRobinAdmissionGroups && paddingOps != 0) {
+            throw new IllegalArgumentException("round-robin admission does not support padding protocol ops");
         }
         int groupCount = (nClients + c - 1) / c;
         CountDownLatch sharedStartLatch = new CountDownLatch(1);
         CountDownLatch[] groupStartLatches = new CountDownLatch[groupCount];
         CountDownLatch[] groupDoneLatches = new CountDownLatch[groupCount];
+        Semaphore[] clientStartPermits = new Semaphore[nClients];
+        Semaphore[] groupDonePermits = new Semaphore[groupCount];
         for (int group = 0; group < groupCount; group++) {
             groupStartLatches[group] = coarseAdmissionGroups
                     ? new CountDownLatch(1)
                     : sharedStartLatch;
             groupDoneLatches[group] = new CountDownLatch(c);
+            groupDonePermits[group] = new Semaphore(0);
+        }
+        for (int client = 0; client < nClients; client++) {
+            clientStartPermits[client] = new Semaphore(0);
         }
         TimestepBarrier round2ReadBarrier = new TimestepBarrier(c);
 
@@ -93,6 +107,9 @@ public class OursBenchmark {
                     readyLatch,
                     groupStartLatches[i / c],
                     groupDoneLatches[i / c],
+                    roundRobinAdmissionGroups,
+                    clientStartPermits[i],
+                    groupDonePermits[i / c],
                     round2ReadBarrier
             );
             clients[i].start();
@@ -100,11 +117,25 @@ public class OursBenchmark {
         }
 
         readyLatch.await();
-        logger.info("Executing experiment, coarseAdmissionGroups={}", coarseAdmissionGroups);
+        logger.info(
+                "Executing experiment, coarseAdmissionGroups={}, roundRobinAdmissionGroups={}",
+                coarseAdmissionGroups,
+                roundRobinAdmissionGroups
+        );
         if (paddingOps > 0) {
             logger.info("Adding {} unmeasured padding accesses to complete the final timestep", paddingOps);
         }
-        if (coarseAdmissionGroups) {
+        if (roundRobinAdmissionGroups) {
+            for (int request = 0; request < nRequests; request++) {
+                for (int group = 0; group < groupCount; group++) {
+                    int firstClient = group * c;
+                    for (int client = firstClient; client < firstClient + c; client++) {
+                        clientStartPermits[client].release();
+                    }
+                    groupDonePermits[group].acquire(c);
+                }
+            }
+        } else if (coarseAdmissionGroups) {
             for (int group = 0; group < groupCount; group++) {
                 groupStartLatches[group].countDown();
                 groupDoneLatches[group].await();
@@ -211,6 +242,9 @@ public class OursBenchmark {
         private final CountDownLatch readyLatch;
         private final CountDownLatch startLatch;
         private final CountDownLatch groupDoneLatch;
+        private final boolean roundRobinAdmissionGroups;
+        private final Semaphore groupStartPermit;
+        private final Semaphore groupDonePermit;
         private final SecureRandom random;
 
         private long completedOps;
@@ -234,6 +268,9 @@ public class OursBenchmark {
                        CountDownLatch readyLatch,
                        CountDownLatch startLatch,
                        CountDownLatch groupDoneLatch,
+                       boolean roundRobinAdmissionGroups,
+                       Semaphore groupStartPermit,
+                       Semaphore groupDonePermit,
                        TimestepBarrier round2ReadBarrier) {
             this.clientId = clientId;
             this.nRequests = nRequests;
@@ -243,6 +280,9 @@ public class OursBenchmark {
             this.readyLatch = readyLatch;
             this.startLatch = startLatch;
             this.groupDoneLatch = groupDoneLatch;
+            this.roundRobinAdmissionGroups = roundRobinAdmissionGroups;
+            this.groupStartPermit = groupStartPermit;
+            this.groupDonePermit = groupDonePermit;
             this.manager = new ORAMManager(clientId, serverIp, serverPort);
             this.accessExecutor = new ClientAccessExecutor(
                     manager,
@@ -268,10 +308,15 @@ public class OursBenchmark {
 
             try {
                 readyLatch.countDown();
-                startLatch.await();
+                if (!roundRobinAdmissionGroups) {
+                    startLatch.await();
+                }
 
                 int protocolRequests = nRequests + paddingRequests;
                 for (int i = 0; i < protocolRequests; i++) {
+                    if (roundRobinAdmissionGroups) {
+                        groupStartPermit.acquire();
+                    }
                     int bid = random.nextInt(bidSpace);
                     Operation operation = random.nextBoolean() ? Operation.WRITE : Operation.READ;
                     byte[] payload = buildPayload(clientId, i, bid, blockSize);
@@ -292,6 +337,9 @@ public class OursBenchmark {
                     if (i < nRequests) {
                         completedOps++;
                     }
+                    if (roundRobinAdmissionGroups) {
+                        groupDonePermit.release();
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -300,7 +348,9 @@ public class OursBenchmark {
                 failure = t;
                 t.printStackTrace();
             } finally {
-                groupDoneLatch.countDown();
+                if (!roundRobinAdmissionGroups) {
+                    groupDoneLatch.countDown();
+                }
                 manager.close();
             }
         }

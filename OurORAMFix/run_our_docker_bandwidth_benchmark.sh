@@ -22,6 +22,7 @@ CLIENT_IO_THREADS="${CLIENT_IO_THREADS:-16}"
 SHARED_CLIENT_IO="${SHARED_CLIENT_IO:-0}"
 DIRECT_CLIENT_RESPONSES="${DIRECT_CLIENT_RESPONSES:-0}"
 COARSE_ADMISSION_GROUPS="${COARSE_ADMISSION_GROUPS:-0}"
+ROUND_ROBIN_ADMISSION_GROUPS="${ROUND_ROBIN_ADMISSION_GROUPS:-0}"
 RETAIN_ALL_HISTORY="${RETAIN_ALL_HISTORY:-1}"
 
 N_REQUESTS="${N_REQUESTS:-1000}"
@@ -63,6 +64,7 @@ Environment variables:
   SHARED_CLIENT_IO           share Netty I/O threads across clients (0/1). Default: $SHARED_CLIENT_IO
   DIRECT_CLIENT_RESPONSES    bypass per-client response thread (0/1). Default: $DIRECT_CLIENT_RESPONSES
   COARSE_ADMISSION_GROUPS    finish one group before admitting the next (0/1). Default: $COARSE_ADMISSION_GROUPS
+  ROUND_ROBIN_ADMISSION_GROUPS rotate request batches after every access (0/1). Default: $ROUND_ROBIN_ADMISSION_GROUPS
   RETAIN_ALL_HISTORY         retain UM/RL versions for delayed clients (0/1). Default: $RETAIN_ALL_HISTORY
 
 Logs:
@@ -86,9 +88,21 @@ if [[ "$COARSE_ADMISSION_GROUPS" == "1" && "$RETAIN_ALL_HISTORY" != "1" ]]; then
     echo "[ERROR] Sleeping client groups otherwise miss evicted UM/RL versions."
     exit 1
 fi
+if [[ "$ROUND_ROBIN_ADMISSION_GROUPS" == "1" && "$RETAIN_ALL_HISTORY" != "1" ]]; then
+    echo "[ERROR] ROUND_ROBIN_ADMISSION_GROUPS=1 requires RETAIN_ALL_HISTORY=1"
+    exit 1
+fi
+if [[ "$COARSE_ADMISSION_GROUPS" == "1" && "$ROUND_ROBIN_ADMISSION_GROUPS" == "1" ]]; then
+    echo "[ERROR] COARSE_ADMISSION_GROUPS and ROUND_ROBIN_ADMISSION_GROUPS are mutually exclusive"
+    exit 1
+fi
 if [[ "$COARSE_ADMISSION_GROUPS" == "1" ]] && (( N_CLIENTS % MAX_CONCURRENT_CLIENTS != 0 )); then
     echo "[ERROR] Coarse admission groups require N_CLIENTS to be divisible by MAX_CONCURRENT_CLIENTS."
     echo "[ERROR] Use COARSE_ADMISSION_GROUPS=0 for sliding FIFO admission with mixed timesteps."
+    exit 1
+fi
+if [[ "$ROUND_ROBIN_ADMISSION_GROUPS" == "1" ]] && (( N_CLIENTS % MAX_CONCURRENT_CLIENTS != 0 )); then
+    echo "[ERROR] Round-robin admission requires N_CLIENTS to be divisible by MAX_CONCURRENT_CLIENTS."
     exit 1
 fi
 
@@ -176,10 +190,10 @@ cat "$IPERF_LOG"
 echo "[INFO] Running OurORAM benchmark"
 echo "[INFO] total clients=$N_CLIENTS, protocol window=$MAX_CONCURRENT_CLIENTS"
 echo "[INFO] client transport: sharedIo=$SHARED_CLIENT_IO ioThreads=$CLIENT_IO_THREADS directResponses=$DIRECT_CLIENT_RESPONSES"
-echo "[INFO] admission: coarseGroups=$COARSE_ADMISSION_GROUPS retainAllHistory=$RETAIN_ALL_HISTORY"
+echo "[INFO] admission: coarseGroups=$COARSE_ADMISSION_GROUPS roundRobinGroups=$ROUND_ROBIN_ADMISSION_GROUPS retainAllHistory=$RETAIN_ALL_HISTORY"
 docker exec "$CLIENT_CONTAINER" bash -lc \
-    "env JAVA_OPTS=\"\$JAVA_HEAP_OPTS -Doram.clientIoThreads=$CLIENT_IO_THREADS -Doram.sharedClientIo=$SHARED_CLIENT_IO -Doram.directClientResponses=$DIRECT_CLIENT_RESPONSES -Doram.coarseAdmissionGroups=$COARSE_ADMISSION_GROUPS\" \
-     JAVA_TOOL_OPTIONS=\"\$JAVA_HEAP_OPTS -Doram.clientIoThreads=$CLIENT_IO_THREADS -Doram.sharedClientIo=$SHARED_CLIENT_IO -Doram.directClientResponses=$DIRECT_CLIENT_RESPONSES -Doram.coarseAdmissionGroups=$COARSE_ADMISSION_GROUPS\" \
+    "env JAVA_OPTS=\"\$JAVA_HEAP_OPTS -Doram.clientIoThreads=$CLIENT_IO_THREADS -Doram.sharedClientIo=$SHARED_CLIENT_IO -Doram.directClientResponses=$DIRECT_CLIENT_RESPONSES -Doram.coarseAdmissionGroups=$COARSE_ADMISSION_GROUPS -Doram.roundRobinAdmissionGroups=$ROUND_ROBIN_ADMISSION_GROUPS\" \
+     JAVA_TOOL_OPTIONS=\"\$JAVA_HEAP_OPTS -Doram.clientIoThreads=$CLIENT_IO_THREADS -Doram.sharedClientIo=$SHARED_CLIENT_IO -Doram.directClientResponses=$DIRECT_CLIENT_RESPONSES -Doram.coarseAdmissionGroups=$COARSE_ADMISSION_GROUPS -Doram.roundRobinAdmissionGroups=$ROUND_ROBIN_ADMISSION_GROUPS\" \
      ./smartrun.sh oram.benchmark.OursBenchmark \
      $N_REQUESTS $N_CLIENTS $MAX_CONCURRENT_CLIENTS $BID_EXPONENT $ROOT_BUCKET_SIZE $COMPETITION_BUCKET_SIZE $BUCKET_SIZE $BLOCK_SIZE $SERVER_CONTAINER $SERVER_PORT" \
     > "$CLIENT_LOG" 2>&1
